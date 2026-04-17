@@ -191,7 +191,10 @@ Create `autoresearch.config.json` in your pi session directory to customize beha
 ```json
 {
   "workingDir": "/path/to/project",
-  "maxIterations": 50
+  "maxIterations": 50,
+  "contextGuardPercent": 80,
+  "contextResetMode": "clear",
+  "contextResetTrigger": "after_experiment"
 }
 ```
 
@@ -199,6 +202,9 @@ Create `autoresearch.config.json` in your pi session directory to customize beha
 |-------|------|-------------|
 | `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays in the session cwd. Fails if the directory doesn't exist. |
 | `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
+| `contextGuardPercent` | number | Context fullness threshold as a percentage (1..100). Used when `contextResetTrigger` is `"guard"`. Default: `80`. |
+| `contextResetMode` | `"compact" \| "clear"` | Reset action. `"compact"` uses normal LLM compaction. `"clear"` uses an aggressive minimal summary path (non-agentic clear mode). Default: `"clear"`. |
+| `contextResetTrigger` | `"guard" \| "after_experiment"` | When to run reset action. `"guard"` triggers near `contextGuardPercent`. `"after_experiment"` triggers after every `log_experiment`. Default: `"after_experiment"`. |
 
 ---
 

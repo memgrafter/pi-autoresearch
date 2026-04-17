@@ -120,19 +120,26 @@ interface LogDetails {
   wallClockSeconds: number | null;
 }
 
+type ContextResetMode = "compact" | "clear";
+type ContextResetTrigger = "guard" | "after_experiment";
+
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
   dashboardExpanded: boolean;
   lastAutoResumeTime: number;
   experimentsThisSession: number;
   autoResumeTurns: number;
+  /** True while a context reset action (compact/clear) is in-flight. */
+  pendingContextReset: boolean;
+  /** Current in-flight context reset mode, if any. */
+  pendingContextResetMode: ContextResetMode | null;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
   /** Context tokens at the start of the current run_experiment call. null if not running. */
   iterationStartTokens: number | null;
-  /** Token cost of each completed iteration (for predicting context exhaustion). */
+  /** Token cost of each completed iteration (telemetry + confidence diagnostics). */
   iterationTokenHistory: number[];
 }
 
@@ -351,23 +358,7 @@ function isBetter(
   return direction === "lower" ? current < best : current > best;
 }
 
-// Why 1.2: iterations vary in cost; 20% buffer prevents overflow on heavier iterations
-const CONTEXT_SAFETY_MARGIN = 1.2;
-
-function estimateTokensPerIteration(history: number[]): number {
-  const mean = history.reduce((a, b) => a + b, 0) / history.length;
-  const sorted = [...history].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-  // Why max(mean, median): outlier-heavy runs inflate the mean, skewed runs inflate the median.
-  // Taking the larger gives a conservative estimate that handles both distributions.
-  return Math.max(mean, median);
-}
-
-function hasRoomForNextIteration(history: number[], currentTokens: number, contextWindow: number): boolean {
-  if (history.length < 1) return true;
-  const projectedTokens = currentTokens + estimateTokensPerIteration(history) * CONTEXT_SAFETY_MARGIN;
-  return projectedTokens <= contextWindow;
-}
+const DEFAULT_CONTEXT_GUARD_PERCENT = 80;
 
 function recordIterationTokens(runtime: AutoresearchRuntime, currentTokens: number | null): void {
   if (runtime.iterationStartTokens == null || currentTokens == null) return;
@@ -388,10 +379,20 @@ function advanceIterationTracking(runtime: AutoresearchRuntime, ctx: ExtensionCo
   runtime.iterationStartTokens = usage.tokens;
 }
 
-function isContextExhausted(runtime: AutoresearchRuntime, ctx: ExtensionContext): boolean {
+function getContextUsagePercent(ctx: ExtensionContext): number | null {
   const usage = ctx.getContextUsage();
-  if (usage?.tokens == null) return false;
-  return !hasRoomForNextIteration(runtime.iterationTokenHistory, usage.tokens, usage.contextWindow);
+  if (!usage) return null;
+  if (typeof usage.percent === "number") return usage.percent;
+  if (typeof usage.tokens === "number" && usage.contextWindow > 0) {
+    return (usage.tokens / usage.contextWindow) * 100;
+  }
+  return null;
+}
+
+function isContextGuardTripped(ctx: ExtensionContext, thresholdPercent: number): boolean {
+  const percent = getContextUsagePercent(ctx);
+  if (percent == null) return false;
+  return percent >= thresholdPercent;
 }
 
 /** Compute the median of a numeric array (returns 0 for empty arrays) */
@@ -455,6 +456,14 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
+  /** Context guard threshold as percent of context window (1..100). Default: 80 */
+  contextGuardPercent?: number;
+  /** Optional alias for contextGuardPercent (kept for compatibility with docs/examples). */
+  contextGuardThresholdPercent?: number;
+  /** Action to run on reset trigger. "compact" = normal compaction, "clear" = aggressive non-agentic clear via compaction hook. */
+  contextResetMode?: ContextResetMode;
+  /** When to trigger reset action. "guard" = only near threshold, "after_experiment" = after every log_experiment. */
+  contextResetTrigger?: ContextResetTrigger;
 }
 
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
@@ -466,6 +475,25 @@ function readConfig(cwd: string): AutoresearchConfig {
   } catch {
     return {};
   }
+}
+
+function readContextGuardPercent(cwd: string): number {
+  const config = readConfig(cwd);
+  const raw = config.contextGuardPercent ?? config.contextGuardThresholdPercent;
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return DEFAULT_CONTEXT_GUARD_PERCENT;
+  if (raw <= 0) return DEFAULT_CONTEXT_GUARD_PERCENT;
+  if (raw > 100) return 100;
+  return raw;
+}
+
+function readContextResetMode(cwd: string): ContextResetMode {
+  const config = readConfig(cwd);
+  return config.contextResetMode === "compact" ? "compact" : "clear";
+}
+
+function readContextResetTrigger(cwd: string): ContextResetTrigger {
+  const config = readConfig(cwd);
+  return config.contextResetTrigger === "guard" ? "guard" : "after_experiment";
 }
 
 /** Read maxExperiments from autoresearch.config.json (if it exists) */
@@ -505,6 +533,39 @@ function validateWorkDir(ctxCwd: string): string | null {
     return `workingDir "${workDir}" (from autoresearch.config.json) does not exist.`;
   }
   return null;
+}
+
+interface ContextResetSettings {
+  guardPercent: number;
+  mode: ContextResetMode;
+  trigger: ContextResetTrigger;
+}
+
+function readContextResetSettings(cwd: string): ContextResetSettings {
+  return {
+    guardPercent: readContextGuardPercent(cwd),
+    mode: readContextResetMode(cwd),
+    trigger: readContextResetTrigger(cwd),
+  };
+}
+
+function pickAggressiveFirstKeptEntryId(
+  branchEntries: Array<{ id: string; type: string; message?: { role?: string } }>,
+  fallback: string
+): string {
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i];
+    if (entry.type === "custom_message" || entry.type === "branch_summary") {
+      return entry.id;
+    }
+    if (entry.type === "message") {
+      const role = entry.message?.role;
+      if (role === "assistant" || role === "user") {
+        return entry.id;
+      }
+    }
+  }
+  return fallback;
 }
 
 /** Baseline = first experiment in current segment */
@@ -637,6 +698,8 @@ function createSessionRuntime(): AutoresearchRuntime {
     lastAutoResumeTime: 0,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
+    pendingContextReset: false,
+    pendingContextResetMode: null,
     lastRunChecks: null,
     lastRunDuration: null,
     runningExperiment: null,
@@ -1037,6 +1100,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.lastAutoResumeTime = 0;
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
+    runtime.pendingContextReset = false;
+    runtime.pendingContextResetMode = null;
     runtime.iterationStartTokens = null;
     runtime.iterationTokenHistory = [];
     runtime.state = createExperimentState();
@@ -1316,6 +1381,51 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
+  const scheduleContextReset = (
+    runtime: AutoresearchRuntime,
+    ctx: ExtensionContext,
+    mode: ContextResetMode,
+    triggerLabel: string
+  ): string => {
+    if (runtime.pendingContextReset) {
+      return "Context reset already in progress.";
+    }
+
+    runtime.pendingContextReset = true;
+    runtime.pendingContextResetMode = mode;
+
+    const compactInstructions =
+      "Compacting an ACTIVE autoresearch loop. Preserve objective, metric definition (name/unit/direction), baseline, best metric, the most recent experiment outcomes + rationale, and the next hypothesis. Keep references to autoresearch.md and autoresearch.jsonl so the next turn can resume immediately.";
+
+    ctx.compact({
+      ...(mode === "compact" ? { customInstructions: compactInstructions } : {}),
+      onComplete: () => {
+        runtime.pendingContextReset = false;
+        runtime.pendingContextResetMode = null;
+        if (!runtime.autoresearchMode) return;
+        const doneMsg =
+          mode === "compact"
+            ? "Compaction complete."
+            : "Context clear complete (non-agentic clear mode).";
+        pi.sendUserMessage(
+          `${doneMsg} Resume the autoresearch loop now — read autoresearch.md, continue experimenting, and keep run_experiment/log_experiment paired. ${BENCHMARK_GUARDRAIL}`
+        );
+      },
+      onError: (error) => {
+        runtime.pendingContextReset = false;
+        runtime.pendingContextResetMode = null;
+        ctx.ui.notify(
+          `Autoresearch ${mode} failed (${triggerLabel}): ${error instanceof Error ? error.message : String(error)}. Start a new pi session to continue.`,
+          "warning"
+        );
+      },
+    });
+
+    return mode === "compact"
+      ? `Triggered compaction (${triggerLabel}) and queued auto-resume for autoresearch.`
+      : `Triggered context clear (${triggerLabel}) and queued auto-resume for autoresearch.`;
+  };
+
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_before_switch", async () => {
@@ -1325,6 +1435,33 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     clearSessionUi(ctx);
     runtimeStore.clear(getSessionKey(ctx));
     stopDashboardServer();
+  });
+
+  // Custom non-agentic clear mode: override compaction with a tiny synthetic summary.
+  pi.on("session_before_compact", async (event, ctx) => {
+    const runtime = getRuntime(ctx);
+    if (!runtime.pendingContextReset || runtime.pendingContextResetMode !== "clear") return;
+
+    const firstKeptEntryId = pickAggressiveFirstKeptEntryId(
+      event.branchEntries as Array<{ id: string; type: string; message?: { role?: string } }>,
+      event.preparation.firstKeptEntryId
+    );
+
+    return {
+      compaction: {
+        summary:
+          "## Goal\nAutoresearch loop is active. Context was intentionally cleared by policy.\n\n## Next Steps\n1. Re-read autoresearch.md and autoresearch.jsonl\n2. Continue the experiment loop with run_experiment + log_experiment\n",
+        firstKeptEntryId,
+        tokensBefore: event.preparation.tokensBefore,
+        details: { readFiles: [], modifiedFiles: [] },
+      },
+    };
+  });
+
+  pi.on("session_compact", async (_event, ctx) => {
+    const runtime = getRuntime(ctx);
+    runtime.pendingContextReset = false;
+    runtime.pendingContextResetMode = null;
   });
 
   // Reset per-session experiment counter when agent starts
@@ -1339,6 +1476,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (overlayTui) overlayTui.requestRender();
 
     if (!runtime.autoresearchMode) return;
+
+    // A reset-triggered resume is queued via ctx.compact callback.
+    if (runtime.pendingContextReset) return;
 
     // Don't auto-resume if no experiments ran this session (user likely stopped manually)
     if (runtime.experimentsThisSession === 0) return;
@@ -1390,7 +1530,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n\n## Autoresearch Mode (ACTIVE)" +
       "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
-      `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
+      `\nExperiment rules: ${mdPath} — read this file at the start of every session and after context reset (compact/clear).` +
       "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
       `\n${BENCHMARK_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
@@ -1499,10 +1639,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
       const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+      const contextReset = readContextResetSettings(ctx.cwd);
+      const contextNote = contextReset.trigger === "guard"
+        ? `\nContext reset: ${contextReset.mode} when context ≥ ${contextReset.guardPercent.toFixed(1)}%`
+        : `\nContext reset: ${contextReset.mode} after every experiment`;
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}${contextNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
         }],
         details: { state: cloneExperimentState(state) },
       };
@@ -1590,12 +1734,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      const contextReset = readContextResetSettings(ctx.cwd);
+
       advanceIterationTracking(runtime, ctx);
-      if (isContextExhausted(runtime, ctx)) {
-        runtime.autoresearchMode = false;
+      if (contextReset.trigger === "guard" && isContextGuardTripped(ctx, contextReset.guardPercent)) {
+        const resetMsg = scheduleContextReset(runtime, ctx, contextReset.mode, `guard ${contextReset.guardPercent.toFixed(1)}%`);
         ctx.abort();
         return {
-          content: [{ type: "text", text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved." }],
+          content: [{ type: "text", text: `🛑 Context guard tripped at ${contextReset.guardPercent.toFixed(1)}%. ${resetMsg}` }],
           details: {},
         };
       }
@@ -2316,6 +2462,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ctx.abort();
       }
 
+      if (!limitReached && runtime.autoresearchMode) {
+        const contextReset = readContextResetSettings(ctx.cwd);
+        if (contextReset.trigger === "after_experiment") {
+          const resetMsg = scheduleContextReset(
+            runtime,
+            ctx,
+            contextReset.mode,
+            `after experiment #${segmentCount}`
+          );
+          text += `\n\n♻️ ${resetMsg}`;
+          ctx.abort();
+        }
+      }
+
       updateWidget(ctx);
 
       // Refresh fullscreen overlay if open
@@ -2827,7 +2987,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastAutoResumeTime = 0;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
-        runtime.pendingCompactResume = false;
+        runtime.pendingContextReset = false;
+        runtime.pendingContextResetMode = null;
         runtime.lastRunChecks = null;
         runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
@@ -2849,6 +3010,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastAutoResumeTime = 0;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
+        runtime.pendingContextReset = false;
+        runtime.pendingContextResetMode = null;
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
         runtime.state = createExperimentState();

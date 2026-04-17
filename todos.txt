@@ -1,0 +1,1 @@
+- TODO: Implement true non-agentic compaction/clear pipeline for autoresearch context resets (no model summarization step), with deterministic state handoff from autoresearch.md + autoresearch.jsonl.
